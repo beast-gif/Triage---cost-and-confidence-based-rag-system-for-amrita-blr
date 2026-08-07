@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+gradio>=6
+pydantic>=2
+
+sentence-transformers
+chromadb
+crawl4ai
+beautifulsoup4
+
+openai
+python-dotenv
+apscheduler
+numpy

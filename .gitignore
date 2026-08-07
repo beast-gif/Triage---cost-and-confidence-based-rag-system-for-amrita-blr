@@ -1,0 +1,8 @@
+.env
+chroma_db/
+manifest.db
+raw_html/
+__pycache__/
+*.pyc
+calibration_data.json
+chunks.jsonl
