@@ -16,9 +16,29 @@ What it does, per URL in seed_urls.json:
        - new_ids & old_ids   -> unchanged           -> skip entirely
   4. Update the manifest with the new chunk_id set for that URL
 
-Pages that were in the manifest before but aren't in seed_urls.json
-this run (or fail to scrape) are left alone by default -- see the
-PURGE_MISSING_PAGES flag below if you want deleted pages auto-removed.
+TWO PASSES
+  Pass 1  the URLs in seed_urls.json
+  Pass 2  faculty profile URLs discovered from the .fc-item card grids
+          during pass 1 — these are never in seed_urls.json
+
+THE PURGE ORDERING BUG (fixed)
+------------------------------
+PURGE_MISSING_PAGES deletes any manifest URL that was not reached this run.
+It used to run BETWEEN pass 1 and pass 2 — but every faculty profile URL is
+only reached in pass 2, so at that moment none of them were in `seen_urls`
+and all of them looked like deleted pages.
+
+Observed live: a single run purged the entire faculty corpus —
+
+    [REMOVED] .../faculty/s-smita/          purged 13 chunks
+    [REMOVED] .../faculty/rg-chittawadigi/  purged 61 chunks
+    [REMOVED] .../faculty/rashmi-m-r/       purged 73 chunks
+    ... and dozens more
+
+Pass 2 then re-scraped and re-embedded all of them, so the data survived, but
+the run cost thousands of needless embeddings and left the store briefly
+missing every faculty member. The purge now runs AFTER pass 2, once
+`seen_urls` actually contains everything that was reached.
 """
 
 import asyncio
@@ -34,9 +54,11 @@ SEED_URLS_FILE = "seed_urls.json"
 
 # If True: a URL that was in the manifest before but wasn't successfully
 # scraped this run gets ALL its chunks deleted (treats it as "page removed").
-# If False: skipped URLs are left untouched (safer default while you're
-# still testing scraping reliability).
-PURGE_MISSING_PAGES = True
+#
+# KEEP THIS FALSE unless you are deliberately cleaning up removed pages. With
+# it on, ONE page failing to scrape — a timeout, a transient 503 — silently
+# deletes that page's chunks even though the page is fine.
+PURGE_MISSING_PAGES = False
 
 # If True: writes each scraped page's raw HTML to raw_html/ so you can
 # inspect page structure later (e.g. to debug extraction issues) without
@@ -56,149 +78,122 @@ def save_html_to_disk(url: str, html: str, out_dir: str = RAW_HTML_DIR):
         f.write(html)
 
 
+def process_page(result, manifest, seen_urls, collect_profiles=None):
+    """
+    Scrape result -> extract -> diff against manifest -> embed only what changed.
+
+    Shared by both passes; they differed only in whether they collected
+    discovered profile URLs, which was enough duplication for the two copies to
+    drift apart.
+
+    Returns (added, deleted, unchanged).
+    """
+    url = result["url"]
+
+    if not result["success"]:
+        print(f"[SKIP] {url} — scrape failed: {result.get('error')}")
+        return 0, 0, 0
+
+    seen_urls.add(url)
+
+    if SAVE_RAW_HTML:
+        save_html_to_disk(url, result["html"])
+
+    chunks, page_profile_urls = extract_chunks(
+        html=result["html"],
+        source_url=url,
+        page_title=result["title"],
+    )
+    if collect_profiles is not None:
+        collect_profiles.update(page_profile_urls)
+
+    chunks_by_id = {c["chunk_id"]: c for c in chunks}
+    new_ids = set(chunks_by_id.keys())
+    old_ids = manifest.get_chunk_ids(url)
+
+    to_add_ids = new_ids - old_ids
+    to_delete_ids = old_ids - new_ids
+    unchanged_count = len(new_ids & old_ids)
+
+    if to_add_ids:
+        to_add_chunks = [chunks_by_id[cid] for cid in to_add_ids]
+        embeddings = embed_texts([c["content"] for c in to_add_chunks])
+        upsert_chunks(to_add_chunks, embeddings)
+
+    if to_delete_ids:
+        delete_chunks(list(to_delete_ids))
+
+    manifest.set_chunk_ids(url, new_ids)
+
+    bits = []
+    if to_add_ids:
+        bits.append(f"+{len(to_add_ids)} new/changed")
+    if to_delete_ids:
+        bits.append(f"-{len(to_delete_ids)} stale")
+    if unchanged_count:
+        bits.append(f"={unchanged_count} unchanged")
+    print(f"[OK] {url} — {', '.join(bits) if bits else 'no chunks'}")
+
+    return len(to_add_ids), len(to_delete_ids), unchanged_count
+
+
 async def sync():
     with open(SEED_URLS_FILE, encoding="utf-8") as f:
         urls = json.load(f)
 
-    print(f"Scraping {len(urls)} URLs...")
-    scrape_results = await scrape_all(urls)
-
     manifest = Manifest()
-    seen_urls = set()
+    seen_urls: set[str] = set()
     discovered_profile_urls: set[str] = set()
 
-    total_added = 0
-    total_deleted = 0
-    total_unchanged = 0
+    total_added = total_deleted = total_unchanged = 0
 
-    for result in scrape_results:
-        url = result["url"]
+    # --- PASS 1: the seed URLs ---
+    print(f"Pass 1 — scraping {len(urls)} seed URLs...")
+    for result in await scrape_all(urls):
+        a, d, u = process_page(result, manifest, seen_urls,
+                               collect_profiles=discovered_profile_urls)
+        total_added += a
+        total_deleted += d
+        total_unchanged += u
 
-        if not result["success"]:
-            print(f"[SKIP] {url} — scrape failed: {result.get('error')}")
-            continue
+    # --- PASS 2: faculty profiles discovered in pass 1 ---
+    # These are never in seed_urls.json; the only reason we know they exist is
+    # the <a href> inside each .fc-item faculty card.
+    if discovered_profile_urls:
+        profile_list = sorted(discovered_profile_urls)
+        print(f"\nPass 2 — {len(profile_list)} faculty profile URLs discovered...")
+        for result in await scrape_all(profile_list):
+            a, d, u = process_page(result, manifest, seen_urls)
+            total_added += a
+            total_deleted += d
+            total_unchanged += u
 
-        seen_urls.add(url)
-
-        if SAVE_RAW_HTML:
-            save_html_to_disk(url, result["html"])
-
-        chunks, page_profile_urls = extract_chunks(
-            html=result["html"],
-            source_url=url,
-            page_title=result["title"],
-        )
-        discovered_profile_urls.update(page_profile_urls)
-        chunks_by_id = {c["chunk_id"]: c for c in chunks}
-        new_ids = set(chunks_by_id.keys())
-        old_ids = manifest.get_chunk_ids(url)
-
-        to_add_ids = new_ids - old_ids
-        to_delete_ids = old_ids - new_ids
-        unchanged_count = len(new_ids & old_ids)
-
-        # Embed + upsert only the new/changed chunks
-        if to_add_ids:
-            to_add_chunks = [chunks_by_id[cid] for cid in to_add_ids]
-            embeddings = embed_texts([c["content"] for c in to_add_chunks])
-            upsert_chunks(to_add_chunks, embeddings)
-
-        # Delete stale chunks whose content no longer exists on the page
-        if to_delete_ids:
-            delete_chunks(list(to_delete_ids))
-
-        manifest.set_chunk_ids(url, new_ids)
-
-        total_added += len(to_add_ids)
-        total_deleted += len(to_delete_ids)
-        total_unchanged += unchanged_count
-
-        status_bits = []
-        if to_add_ids:
-            status_bits.append(f"+{len(to_add_ids)} new/changed")
-        if to_delete_ids:
-            status_bits.append(f"-{len(to_delete_ids)} stale")
-        if unchanged_count:
-            status_bits.append(f"={unchanged_count} unchanged")
-        status = ", ".join(status_bits) if status_bits else "no chunks"
-        print(f"[OK] {url} — {status}")
-
-    # Handle pages that disappeared from seed_urls.json / failed to scrape
+    # --- purge, AFTER both passes ---
+    # seen_urls only contains every reachable page once pass 2 has finished.
+    # Running this earlier deleted the entire faculty corpus every time.
     if PURGE_MISSING_PAGES:
+        print("\nPurging pages no longer present...")
         for old_url in manifest.all_urls():
             if old_url not in seen_urls:
                 stale_ids = manifest.get_chunk_ids(old_url)
                 delete_chunks(list(stale_ids))
                 manifest.remove_url(old_url)
                 total_deleted += len(stale_ids)
-                print(f"[REMOVED] {old_url} — page no longer present, purged {len(stale_ids)} chunks")
-
-    # PASS 2: scrape the faculty profile URLs discovered while processing
-    # the main seed_urls.json pages above. These aren't in seed_urls.json
-    # themselves — we only know they exist because we found the link
-    # inside each faculty card. Same scrape -> extract -> diff -> embed
-    # logic applies, just for this dynamically-discovered URL set.
-    if discovered_profile_urls:
-        profile_url_list = sorted(discovered_profile_urls)
-        print(f"\nDiscovered {len(profile_url_list)} faculty profile URLs — scraping...")
-        profile_scrape_results = await scrape_all(profile_url_list)
-
-        for result in profile_scrape_results:
-            url = result["url"]
-
-            if not result["success"]:
-                print(f"[SKIP] {url} — scrape failed: {result.get('error')}")
-                continue
-
-            if SAVE_RAW_HTML:
-                save_html_to_disk(url, result["html"])
-
-            chunks, _ = extract_chunks(
-                html=result["html"],
-                source_url=url,
-                page_title=result["title"],
-            )
-            chunks_by_id = {c["chunk_id"]: c for c in chunks}
-            new_ids = set(chunks_by_id.keys())
-            old_ids = manifest.get_chunk_ids(url)
-
-            to_add_ids = new_ids - old_ids
-            to_delete_ids = old_ids - new_ids
-            unchanged_count = len(new_ids & old_ids)
-
-            if to_add_ids:
-                to_add_chunks = [chunks_by_id[cid] for cid in to_add_ids]
-                embeddings = embed_texts([c["content"] for c in to_add_chunks])
-                upsert_chunks(to_add_chunks, embeddings)
-
-            if to_delete_ids:
-                delete_chunks(list(to_delete_ids))
-
-            manifest.set_chunk_ids(url, new_ids)
-
-            total_added += len(to_add_ids)
-            total_deleted += len(to_delete_ids)
-            total_unchanged += unchanged_count
-
-            status_bits = []
-            if to_add_ids:
-                status_bits.append(f"+{len(to_add_ids)} new/changed")
-            if to_delete_ids:
-                status_bits.append(f"-{len(to_delete_ids)} stale")
-            if unchanged_count:
-                status_bits.append(f"={unchanged_count} unchanged")
-            status = ", ".join(status_bits) if status_bits else "no chunks"
-            print(f"[OK] {url} — {status}")
+                print(f"[REMOVED] {old_url} — purged {len(stale_ids)} chunks")
 
     manifest.close()
 
     print("\n" + "=" * 50)
     print("SYNC SUMMARY")
     print("=" * 50)
+    print(f"Pages reached        : {len(seen_urls)}")
     print(f"Chunks added/updated : {total_added}")
     print(f"Chunks deleted       : {total_deleted}")
     print(f"Chunks unchanged     : {total_unchanged}")
     print(f"Total in vector store: {count()}")
+    if PURGE_MISSING_PAGES:
+        print("\nNOTE: purge was ON. Set PURGE_MISSING_PAGES = False for "
+              "routine syncs — one failed scrape deletes a live page's chunks.")
 
 
 if __name__ == "__main__":
