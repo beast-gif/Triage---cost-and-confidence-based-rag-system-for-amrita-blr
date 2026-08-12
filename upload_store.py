@@ -37,6 +37,13 @@ from datetime import datetime, timezone
 
 import chromadb
 
+# The SAME lock object as store.py, not a new one. Both modules open the same
+# chroma_db path, and Chroma's client registry is keyed by path — two separate
+# locks would each be held while the other thread corrupted the shared entry.
+# Concurrent retrieval across both stores surfaced this as
+# `KeyError: 'chroma_db'`.
+from store import CHROMA_INIT_LOCK
+
 DB_PATH = "chroma_db"                  # same directory, different collection
 COLLECTION_NAME = "triage_uploads"
 REGISTRY_FILE = "uploads_registry.json"
@@ -48,11 +55,13 @@ _collection = None
 def get_collection():
     global _client, _collection
     if _collection is None:
-        _client = chromadb.PersistentClient(path=DB_PATH)
-        _collection = _client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
+        with CHROMA_INIT_LOCK:
+            if _collection is None:
+                _client = chromadb.PersistentClient(path=DB_PATH)
+                _collection = _client.get_or_create_collection(
+                    name=COLLECTION_NAME,
+                    metadata={"hnsw:space": "cosine"},
+                )
     return _collection
 
 

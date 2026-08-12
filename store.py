@@ -8,6 +8,8 @@ which chunks get embedded (only new/changed ones) vs just deleted
 (no embedding needed to delete).
 """
 
+import threading
+
 import chromadb
 
 DB_PATH = "chroma_db"
@@ -20,15 +22,31 @@ RESERVED_KEYS = {"chunk_id", "content"}
 _client = None
 _collection = None
 
+# chromadb.PersistentClient keeps a process-wide registry of systems keyed by
+# path, and building an entry is not atomic. store.py and upload_store.py open
+# the SAME path, and score_query() now starts both retrievals concurrently — so
+# two threads raced into the registry and one read a half-written entry:
+#
+#     KeyError: 'chroma_db'   in shared_system_client._create_system_if_not_exists
+#
+# Sequential code never hit this. The lock is shared across both modules via
+# this module-level object; upload_store imports it rather than making its own,
+# since two separate locks would not protect a shared registry.
+CHROMA_INIT_LOCK = threading.Lock()
+
 
 def get_collection():
     global _client, _collection
     if _collection is None:
-        _client = chromadb.PersistentClient(path=DB_PATH)
-        _collection = _client.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
+        with CHROMA_INIT_LOCK:
+            # Re-check inside the lock: another thread may have finished while
+            # this one was waiting.
+            if _collection is None:
+                _client = chromadb.PersistentClient(path=DB_PATH)
+                _collection = _client.get_or_create_collection(
+                    name=COLLECTION_NAME,
+                    metadata={"hnsw:space": "cosine"},
+                )
     return _collection
 
 

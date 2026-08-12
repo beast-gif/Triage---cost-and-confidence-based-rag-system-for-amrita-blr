@@ -183,6 +183,72 @@ def trigger_sync():
            + data_status()
 
 
+# ---------------------------------------------------------------------------
+# uploaded documents
+# ---------------------------------------------------------------------------
+def upload_status():
+    from upload_store import count, list_documents
+
+    docs = list_documents()
+    if not docs:
+        return "No documents uploaded yet."
+
+    rows = [f"**{len(docs)} document(s), {count()} chunks**\n"]
+    for d in docs:
+        rows.append(
+            f"- `{d['doc_id']}` — **{d['title']}**  \n"
+            f"  {d['chunks']} chunks across {d['pages']} page(s), "
+            f"from `{d['filename']}`, added {d['uploaded_at'][:10]}"
+        )
+    return "\n".join(rows)
+
+
+def do_upload(file_obj, title):
+    """
+    Parse, embed and store an uploaded document.
+
+    The title matters more than it looks: every chunk is prefixed
+    "From {title}, page {n}:", and that prefix is the only context a chunk
+    carries once split from its neighbours. Measured on the academic calendar,
+    part 2 of the July page held "29-Jul | Wed | H | Guru Poornima (Holiday)"
+    with no year anywhere in it. Titling the upload "Academic Calendar 2026-27"
+    puts the year in every chunk at zero parsing cost.
+    """
+    if file_obj is None:
+        return "Choose a file first.", upload_status()
+
+    from ingest_doc import ingest
+
+    path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+    title = (title or "").strip() or None
+
+    try:
+        record = ingest(path, title=title)
+    except Exception as exc:
+        return f"Upload failed: `{exc}`", upload_status()
+
+    return (
+        f"Stored **{record['title']}** as `{record['doc_id']}` — "
+        f"{record['chunks']} chunks across {record['pages']} page(s).",
+        upload_status(),
+    )
+
+
+def do_delete(doc_id):
+    from upload_store import delete_document
+
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        return "Enter a document id — the `backticked` value in the list below.", \
+               upload_status()
+
+    removed = delete_document(doc_id)
+    if not removed:
+        return f"No document with id `{doc_id}`.", upload_status()
+    return (f"Deleted **{removed['title']}** ({removed['chunks']} chunks).",
+            upload_status())
+
+
 EXAMPLES = [
     "what is the fee for btech ECE",
     "who is the HOD of ECE",
@@ -199,7 +265,7 @@ with gr.Blocks(title="Triage") as demo:
     gr.Markdown(
         "# Triage\n"
         "Confidence- and cost-aware RAG for **Amrita Vishwa Vidyapeetham, "
-        "Bengaluru** \n\n"
+        "Bengaluru** admissions.\n\n"
         "Every answer shows how confident the system is, which retrieval "
         "strategy produced it, and whether the generation model was called at "
         "all — low-confidence queries are refused *without* spending on "
@@ -230,6 +296,47 @@ with gr.Blocks(title="Triage") as demo:
         inspect_btn = gr.Button("Score", variant="primary")
         inspect_out = gr.Markdown()
         inspect_btn.click(inspect, inspect_box, inspect_out)
+
+    with gr.Tab("Documents"):
+        gr.Markdown(
+            "Upload PDFs, slide decks or Word documents — timetables, academic "
+            "calendars, anything the website does not cover. These are stored "
+            "**separately** from the scraped web content, with their own "
+            "confidence calibration, and a weekly sync can never touch them.\n\n"
+            "Give each document a descriptive title. It is prefixed to every "
+            "chunk, so *Academic Calendar 2026-27* puts the year into chunks "
+            "that would otherwise only say *29-Jul*."
+        )
+        with gr.Row():
+            upload_file = gr.File(
+                label="File",
+                file_types=[".pdf", ".pptx", ".docx", ".txt", ".md"],
+                scale=3,
+            )
+            upload_title = gr.Textbox(
+                label="Title",
+                placeholder="Academic Calendar 2026-27",
+                scale=2,
+            )
+        upload_btn = gr.Button("Upload and index", variant="primary")
+        upload_msg = gr.Markdown()
+
+        gr.Markdown("---")
+        with gr.Row():
+            delete_id = gr.Textbox(
+                label="Delete by document id",
+                placeholder="academic-calendar-2026-27",
+                scale=3,
+            )
+            delete_btn = gr.Button("Delete", variant="stop", scale=1)
+
+        docs_list = gr.Markdown(value="Click refresh to load.")
+        docs_refresh = gr.Button("Refresh list")
+
+        upload_btn.click(do_upload, [upload_file, upload_title],
+                         [upload_msg, docs_list])
+        delete_btn.click(do_delete, delete_id, [upload_msg, docs_list])
+        docs_refresh.click(upload_status, None, docs_list)
 
     with gr.Tab("Data"):
         gr.Markdown(
