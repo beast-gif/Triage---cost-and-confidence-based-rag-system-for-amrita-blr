@@ -61,38 +61,66 @@ import math
 
 TOP_K = 5
 
-# --- absolute term -------------------------------------------------------
-# "is the top hit objectively strong, regardless of context?"
-# Midpoint 0.85 sits above every unanswerable query's top1 (max was 0.6151)
-# and below the redundant-answer queries (0.9632, 0.9956).
-ABS_MIDPOINT = 0.85
-ABS_TEMP = 0.05
+# --- per-store calibration profiles -------------------------------------
+# The two stores need DIFFERENT constants, and more than that, they rely on
+# DIFFERENT SIGNALS. Both were measured, not chosen.
+#
+# WEB STORE (25 labelled queries, 6 negatives)
+#     Scraped prose. abs_signal alone fails: "who is the HOD of ECE" retrieves
+#     correctly at top1=0.0873, which no absolute threshold can accept without
+#     also accepting noise. sep_signal carries it — that chunk sits 73x above
+#     its background.
+#
+# UPLOAD STORE (14 labelled queries, 6 negatives)
+#     Every chunk is a month of the same calendar, sharing column headers, the
+#     school name and the word "Holiday". Measured:
+#
+#         top1   answerable 0.1646-0.9557   not answerable 0.0000-0.0101
+#                SEPARATED, margin 0.1546
+#         ratio  answerable 5.2-927x        not answerable 1.0-18.3x
+#                OVERLAP — "what holidays are there in October" scored 5.2x
+#                while genuinely being the right answer
+#
+#     So sep_signal INVERTS here. A homogeneous document set has no meaningful
+#     noise floor: "when is Deepavali" scored 927x not because 0.2532 is a
+#     strong match but because every other chunk scored 0.0005.
+#
+#     Hence use_sep=False and a low absolute midpoint. 0.06 rather than the
+#     midpoint of the measured gap (0.0874) because the binding constraint is
+#     the October query at 0.1646 — on this store a false refusal costs more
+#     than a weak answer, since the web store can still outrank it.
+WEB_PROFILE = {
+    "name": "web",
+    "abs_midpoint": 0.85,
+    "abs_temp": 0.05,
+    "sep_midpoint": 1.20,
+    "sep_temp": 0.20,
+    "use_sep": True,
+}
 
-# --- separation term -----------------------------------------------------
-# "does the top hit tower over THIS query's own noise floor?"
-# Measured log10(top1 / mean(rest)):
-#     answerable, found well : 1.41, 1.88, 1.19, 1.21, 2.02, 2.57
-#     unanswerable           : 0.89, 1.00, 0.75
-# Midpoint 1.2 sits in the gap.
-SEP_MIDPOINT = 1.20
-SEP_TEMP = 0.20
+UPLOAD_PROFILE = {
+    "name": "upload",
+    "abs_midpoint": 0.06,
+    "abs_temp": 0.03,
+    "sep_midpoint": None,
+    "sep_temp": None,
+    "use_sep": False,
+}
+
 SEP_EPS = 1e-4          # guard against a zero noise floor
 
-# --- rank term -----------------------------------------------------------
-# Observed top1-top2 gaps: min 0.0003, median 0.0231, max 0.3424.
-# T=0.05 maps the median gap to ~0.43.
+# Observed top1-top2 gaps on the web store: min 0.0003, median 0.0231,
+# max 0.3424. T=0.05 maps the median gap to ~0.43.
 RANK_TEMP = 0.05
 
-# --- ensemble ------------------------------------------------------------
 # The ensemble classifies the QUERY TEXT and never sees the retrieved chunks,
 # so it cannot be evidence that retrieval succeeded — only a discount when the
 # query itself is ambiguous. Multiplicative, capped at a 30% reduction.
 ENSEMBLE_FLOOR = 0.70
 ENSEMBLE_SPAN = 0.30
 
-# --- bands ---------------------------------------------------------------
-# Fitted so all 3 unanswerable queries land LOW (0.10, 0.17, 0.27) and
-# well-retrieved answerable ones land HIGH (0.91-1.00).
+# Fitted so all unanswerable web queries land LOW (0.09-0.26) and
+# well-retrieved ones land HIGH (0.91-1.00).
 BAND_HIGH = 0.70
 BAND_MEDIUM = 0.35
 
@@ -107,22 +135,25 @@ def _sigmoid(x):
 # ---------------------------------------------------------------------------
 # the two signals
 # ---------------------------------------------------------------------------
-def abs_signal(scores):
+def abs_signal(scores, profile=WEB_PROFILE):
     """How strong is the top hit on its own terms?"""
     if not scores:
         return 0.0
     top1 = max(scores)
-    return _sigmoid((top1 - ABS_MIDPOINT) / ABS_TEMP)
+    return _sigmoid((top1 - profile["abs_midpoint"]) / profile["abs_temp"])
 
 
-def sep_signal(scores, top_k=TOP_K):
+def sep_signal(scores, top_k=TOP_K, profile=WEB_PROFILE):
     """
     How far does the top hit stand above this query's own noise floor?
 
-    Uses log10 of the ratio because the ratios span two orders of magnitude
-    (1.4x to 374x); a linear scale would saturate immediately.
+    Uses log10 of the ratio because the ratios span orders of magnitude
+    (1.4x to 374x on the web store); a linear scale would saturate immediately.
+
+    Returns 0.0 when the profile disables it — see UPLOAD_PROFILE for why a
+    homogeneous document set makes this signal actively misleading.
     """
-    if len(scores) < 2:
+    if not profile.get("use_sep") or len(scores) < 2:
         return 0.0
     ordered = sorted(scores, reverse=True)
     top1 = ordered[0]
@@ -132,43 +163,55 @@ def sep_signal(scores, top_k=TOP_K):
     ratio = (top1 + SEP_EPS) / (floor + SEP_EPS)
     if ratio <= 0:
         return 0.0
-    return _sigmoid((math.log10(ratio) - SEP_MIDPOINT) / SEP_TEMP)
+    return _sigmoid(
+        (math.log10(ratio) - profile["sep_midpoint"]) / profile["sep_temp"]
+    )
 
 
-def set_confidence(scores, top_k=TOP_K, filtered=False):
+def set_confidence(scores, top_k=TOP_K, filtered=False, profile=WEB_PROFILE):
     """
     "Is the answer inside the retrieved set?"
 
-        unfiltered pool:  max(abs_signal, sep_signal)
-        filtered pool:    max(abs_signal, rank_confidence)
+        sep enabled, unfiltered : max(abs_signal, sep_signal)
+        sep enabled, filtered   : max(abs_signal, rank_confidence)
+        sep disabled            : abs_signal alone
 
-    WHY FILTERED POOLS NEED A DIFFERENT SIGNAL
-    ------------------------------------------
+    WHY max() AND NOT A WEIGHTED SUM (web store)
+    --------------------------------------------
+    Two correct answers had mirror-image profiles:
+
+        "eligibility for btech"   abs 0.95   sep 0.01
+        "who is the HOD of ECE"   abs 0.00   sep 0.96
+
+    The first has eight equally-correct chunks (every program page repeats the
+    same eligibility text) so nothing separates. The second scores feebly in
+    absolute terms but sits 73x above its background. Averaging scores both
+    around 0.48 and flags both uncertain.
+
+    WHY FILTERED POOLS NEED rank_confidence INSTEAD
+    -----------------------------------------------
     sep_signal measures the winner against the REJECTED chunks. A metadata
-    filter removes the rejects before scoring, so there is no noise floor left
-    to measure against.
+    filter removes the rejects before scoring, so there is no noise floor left.
+    Observed on "who is the chairman of mechanical engineering", filtered to
+    designation='principal':
 
-    Observed live on "who is the chairman of mechanical engineering", filtered
-    to designation='principal':
+        pool = [Sriram 0.3862, Gopalakrishnan 0.1832]
+        floor falls back to the runner-up, ratio 2.1x, sep_signal 0.012 -> LOW
 
-        pool = [Sriram 0.3862, Gopalakrishnan 0.1832]     only 2 candidates
-        floor falls back to the runner-up = 0.1832
-        ratio = 2.1x  ->  sep_signal = 0.012  ->  LOW
-
-    The correct answer was ranked #1, and the score said LOW — because the
-    "noise floor" was the other Principal, a legitimate chunk rather than
-    noise. The filter worked so well it destroyed the signal.
-
-    On a filtered pool the meaningful question is not "is there signal above
-    noise" — the filter already guaranteed relevance — but "did the filter
-    single out one clear winner". That is rank_confidence, which scored 0.9994
-    on the same query.
+    The correct answer was rank #1 and the score said LOW, because the "noise
+    floor" was the other Principal — a legitimate chunk. On a filtered pool the
+    meaningful question is whether the filter singled out one clear winner.
     """
     if not scores:
         return 0.0
+
+    absolute = abs_signal(scores, profile)
+
+    if not profile.get("use_sep"):
+        return absolute
     if filtered:
-        return max(abs_signal(scores), rank_confidence(scores, top_k))
-    return max(abs_signal(scores), sep_signal(scores, top_k))
+        return max(absolute, rank_confidence(scores, top_k))
+    return max(absolute, sep_signal(scores, top_k, profile))
 
 
 def rank_confidence(scores, top_k=TOP_K):
@@ -195,23 +238,29 @@ def band(score):
     return "low"
 
 
-def compute_confidence_v2(scores, ensemble_agreement, top_k=TOP_K, filtered=False):
+def compute_confidence_v2(scores, ensemble_agreement, top_k=TOP_K,
+                          filtered=False, profile=WEB_PROFILE):
     """
     scores:   RAW CrossEncoder.predict() values for the full candidate pool.
               Do NOT sigmoid these first — predict() already did.
     filtered: True when the pool came from a metadata-filtered retrieval, in
-              which case sep_signal is undefined (no rejected set exists) and
-              rank_confidence takes its place. See set_confidence().
+              which case sep_signal has no rejected set to measure against.
+    profile:  WEB_PROFILE or UPLOAD_PROFILE. The two stores were calibrated
+              separately and rely on different signals; passing the wrong one
+              produces confident nonsense rather than an error.
     """
-    sc = set_confidence(scores, top_k, filtered)
+    sc = set_confidence(scores, top_k, filtered, profile)
     rc = rank_confidence(scores, top_k)
     final = sc * (ENSEMBLE_FLOOR + ENSEMBLE_SPAN * ensemble_agreement)
 
+    uses_sep = profile.get("use_sep") and not filtered
+
     return {
+        "store": profile.get("name"),
         "set_confidence": round(sc, 4),
         "rank_confidence": round(rc, 4),
-        "abs_signal": round(abs_signal(scores), 4),
-        "sep_signal": round(sep_signal(scores, top_k), 4) if not filtered else None,
+        "abs_signal": round(abs_signal(scores, profile), 4),
+        "sep_signal": round(sep_signal(scores, top_k, profile), 4) if uses_sep else None,
         "filtered_pool": filtered,
         "ensemble_agreement": round(ensemble_agreement, 4),
         "final": round(final, 4),
@@ -263,6 +312,25 @@ CALIBRATION = [
         0.0036, 0.0035, 0.0026, 0.0017, 0.0004, 0.0002, 0.0001]),
 ]
 
+# Upload store — 14 labelled queries against the academic calendar. Only top1
+# matters for this profile (use_sep=False), so the pools are abbreviated.
+UPLOAD_CALIBRATION = [
+    ("classes commence for UG-S3", True, [0.7418, 0.6886, 0.4577, 0.3709]),
+    ("mid semester exam", True, [0.6908, 0.3308, 0.2763, 0.2749]),
+    ("holidays in October", True, [0.1646, 0.0775, 0.0527, 0.0523]),
+    ("end semester exam start", True, [0.9557, 0.8555, 0.1070, 0.0469]),
+    ("when is Deepavali", True, [0.2532, 0.0005, 0.0004, 0.0003]),
+    ("semester vacation start", True, [0.2208, 0.0373, 0.0200, 0.0100]),
+    ("is 15 August a holiday", True, [0.1828, 0.0207, 0.0100, 0.0050]),
+    ("last instruction day", True, [0.5562, 0.0041, 0.0020, 0.0010]),
+    ("who is the HOD of ECE", False, [0.0001, 0.0001, 0.0001, 0.0000]),
+    ("fee for btech ECE", False, [0.0000, 0.0000, 0.0000, 0.0000]),
+    ("hostel facilities", False, [0.0000, 0.0000, 0.0000, 0.0000]),
+    ("placement record for computing", False, [0.0021, 0.0012, 0.0008, 0.0005]),
+    ("eligibility for btech admission", False, [0.0010, 0.0004, 0.0003, 0.0002]),
+    ("principal of the school of computing", False, [0.0101, 0.0078, 0.0050, 0.0030]),
+]
+
 if __name__ == "__main__":
     print("=" * 88)
     print("confidence_v2 self-test — real reranker scores, 12 calibration queries")
@@ -305,3 +373,30 @@ if __name__ == "__main__":
     print("  separation) is indistinguishable from the correct HOD query")
     print("  (top1=0.0873, 76x). This failure is invisible to any formula")
     print("  built on reranker scores alone.")
+
+    # -----------------------------------------------------------------------
+    print("\n\n" + "=" * 88)
+    print("UPLOAD PROFILE — academic calendar, 14 queries, sep_signal DISABLED")
+    print("=" * 88)
+    print(f"{'query':<40} {'expect':>7} {'top1':>8} {'set':>7} {'band':>7}")
+    print("-" * 88)
+
+    up_good, up_bad = [], []
+    for query, answerable, scores in UPLOAD_CALIBRATION:
+        r = compute_confidence_v2(scores, 1.0, profile=UPLOAD_PROFILE)
+        print(f"{query[:40]:<40} {('yes' if answerable else 'no'):>7} "
+              f"{max(scores):>8.4f} {r['set_confidence']:>7.3f} {r['band']:>7}")
+        (up_good if answerable else up_bad).append(r["final"])
+
+    print(f"\n  answerable   : {min(up_good):.3f} .. {max(up_good):.3f}")
+    print(f"  NOT answerable: {min(up_bad):.3f} .. {max(up_bad):.3f}")
+    clean_up = min(up_good) > max(up_bad)
+    print(f"  separated? {'YES' if clean_up else 'NO'}"
+          + (f"   margin {min(up_good) - max(up_bad):.3f}" if clean_up else ""))
+
+    print("\n  Note the signals SWAP between stores. On the web store")
+    print("  sep_signal is essential — 'who is the HOD of ECE' scores 0.0873")
+    print("  absolute and only separation rescues it. On the upload store")
+    print("  sep_signal inverts: every chunk is a month of the same calendar,")
+    print("  so 'when is Deepavali' scored 927x not because 0.2532 is strong")
+    print("  but because everything else scored 0.0005.")
