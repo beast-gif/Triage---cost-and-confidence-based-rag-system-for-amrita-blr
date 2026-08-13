@@ -45,7 +45,7 @@ import re
 MAX_CHARS = 1200
 MIN_CHARS = 120
 
-SUPPORTED = {".pdf", ".pptx", ".docx", ".txt", ".md"}
+SUPPORTED = {".pdf", ".pptx", ".docx", ".xlsx", ".xlsm", ".txt", ".md"}
 
 
 def _clean(text):
@@ -169,10 +169,54 @@ def _extract_plain(path):
     return [{"text": p, "page": 1, "kind": "text"} for p in parts if p]
 
 
+def _extract_xlsx(path):
+    """
+    One block per sheet, rows pipe-separated like any other table.
+
+    Spreadsheets are the EASIEST case in this module — the grid is already
+    structured, so there is no layout to reconstruct. Compare the academic
+    calendar, where pypdf detached events from their dates because it read by
+    text-object order rather than cell position.
+
+    read_only=True streams rather than loading the whole workbook, and
+    data_only=True returns the cached VALUE of a formula rather than the
+    formula text — a timetable cell showing "9:00" should index as "9:00",
+    not "=B2+TIME(1,0,0)".
+    """
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    blocks = []
+
+    for index, sheet in enumerate(workbook.worksheets, start=1):
+        rows = []
+        for row in sheet.iter_rows(values_only=True):
+            cells = [_clean(str(c)) for c in row if c is not None]
+            cells = [c for c in cells if c]
+            if cells:
+                rows.append(" | ".join(cells))
+
+        if not rows:
+            continue
+
+        # The sheet name is often the only thing identifying what the grid is
+        # ("Sem 3", "Mon-Fri"), and it is nowhere in the cells themselves.
+        blocks.append({
+            "text": f"Sheet: {sheet.title}\n" + "\n".join(rows),
+            "page": index,
+            "kind": "sheet",
+        })
+
+    workbook.close()
+    return blocks
+
+
 EXTRACTORS = {
     ".pdf": _extract_pdf,
     ".pptx": _extract_pptx,
     ".docx": _extract_docx,
+    ".xlsx": _extract_xlsx,
+    ".xlsm": _extract_xlsx,
     ".txt": _extract_plain,
     ".md": _extract_plain,
 }

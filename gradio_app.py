@@ -310,7 +310,8 @@ with gr.Blocks(title="Triage") as demo:
         with gr.Row():
             upload_file = gr.File(
                 label="File",
-                file_types=[".pdf", ".pptx", ".docx", ".txt", ".md"],
+                file_types=[".pdf", ".pptx", ".docx", ".xlsx", ".xlsm",
+                            ".txt", ".md"],
                 scale=3,
             )
             upload_title = gr.Textbox(

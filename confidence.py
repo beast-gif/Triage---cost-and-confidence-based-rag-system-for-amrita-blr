@@ -68,7 +68,7 @@ TOP_K = 5
 # The upload store is small (one calendar is 9 chunks), so retrieve everything
 # rather than a top-N slice. There is no meaningful vector-search cost at this
 # size, and a truncated pool would hide chunks the reranker should judge.
-UPLOAD_N = 30
+UPLOAD_N = 15
 
 # A metadata-filtered pool is small by construction (6 head chunks, 4 principal
 # chunks today), so ask for plenty. Otherwise Chroma's vector index — not the
