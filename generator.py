@@ -220,11 +220,17 @@ def generate_answer(query, result):
     }
 
 
-async def answer_query(query):
-    """Full pipeline: retrieve -> score -> generate."""
+async def answer_query(query, history=None):
+    """
+    Full pipeline: rewrite -> retrieve -> score -> generate.
+
+    `history` is only used to make a follow-up question standalone for
+    RETRIEVAL. The generator still receives the user's original wording — it
+    reads better, and the rewritten form is a machine artefact.
+    """
     from confidence import score_query
 
-    result = await score_query(query)
+    result = await score_query(query, history=history)
     generated = generate_answer(query, result)
     generated["confidence"] = result.get("final_confidence")
     generated["route"] = result.get("route")

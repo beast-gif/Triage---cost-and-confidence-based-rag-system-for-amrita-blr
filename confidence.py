@@ -59,6 +59,7 @@ from embedder import embed_query
 from ensemble import get_ensemble_votes
 from query_expand import expand_query
 from reranker import rerank
+from rewrite import rewrite_query
 from spell_fix import correct_query
 from store import get_collection
 from upload_store import count as upload_count
@@ -247,7 +248,7 @@ def _retrieve_uploads(query: str, top_k: int):
 BAND_RANK = {"low": 0, "medium": 1, "high": 2}
 
 
-async def score_query(query: str, top_k: int = TOP_K) -> dict:
+async def score_query(query: str, top_k: int = TOP_K, history=None) -> dict:
     """
     Use THIS from FastAPI; __main__ wraps it in asyncio.run().
 
@@ -273,10 +274,16 @@ async def score_query(query: str, top_k: int = TOP_K) -> dict:
     store wins: a hand-curated document an admin deliberately added is more
     authoritative than a scraped page.
     """
-    # Typos first, then abbreviations — so "endsm" -> "endsem" -> "end
-    # semester exam" chains. Reversed, the expander would not recognise the
-    # misspelled form. Both affect retrieval ONLY; the generator still receives
-    # the user's original wording.
+    # Conversation memory. MUST run first: retrieve_for() picks its route from
+    # the query text, so "what about EEE" routes nowhere until it becomes
+    # "who is the chairperson of EEE". Skipped entirely — no LLM call — when
+    # the query is already standalone, which most are.
+    query, _rewritten = rewrite_query(query, history)
+
+    # Typos, then abbreviations — so "endsm" -> "endsem" -> "end semester
+    # exam" chains. Reversed, the expander would not recognise the misspelled
+    # form. Both affect retrieval ONLY; the generator still receives the
+    # user's original wording.
     query, _ = correct_query(query)
     query = expand_query(query)
     t0 = time.time()

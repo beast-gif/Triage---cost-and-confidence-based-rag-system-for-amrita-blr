@@ -26,6 +26,7 @@ Run locally:
 """
 
 import asyncio
+import re
 
 import gradio as gr
 
@@ -48,37 +49,140 @@ faculty profile pages discovered from the faculty card grids in pass 2.
 """
 
 
-def _photo(result):
+def _name_from_url(url):
     """
-    Show the faculty photo when the answer came from a person's page.
+    Derive a display name from a faculty profile slug.
 
-    NO photo on a refusal. Chunks are still populated when the band is LOW and
-    the LLM was never called, so without this guard a faculty face appears
-    above "I don't have that information."
+    Chunks carry source_url and photo_url but no name field, and adding one
+    would mean changing the extractor, re-syncing and backfilling ~4,900
+    chunks. The slug is already here.
 
-    MARKDOWN, NOT AN <img> TAG. Gradio 6 sanitises <img> out of message
-    content — the tag was being built correctly and silently discarded.
+        /faculty/gayathri-r/     -> Gayathri R.
+        /faculty/tk-ramesh/      -> T. K. Ramesh
+        /faculty/susmitha-vekkot/-> Susmitha Vekkot
 
-    Only the TOP chunk. A query can retrieve several people, and showing the
-    first one's face above an answer naming four would be misleading.
+    Imperfect by construction — initials are the weak spot, since 'tk' could
+    be two initials or a short name. Segments of one or two letters are
+    treated as initials, which is right far more often than not on this site.
+    """
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    if not slug:
+        return ""
+
+    parts = []
+    for piece in slug.split("-"):
+        if not piece:
+            continue
+        if len(piece) <= 2 and piece.isalpha():
+            # 'tk' -> 'T. K.',  'r' -> 'R.'
+            parts.append(". ".join(c.upper() for c in piece) + ".")
+        else:
+            parts.append(piece.capitalize())
+    return " ".join(parts)
+
+
+def _already_shown(history):
+    """
+    Photo URLs this conversation has already rendered.
+
+    Read back out of the transcript rather than tracked in a variable, because
+    Gradio hands the full history to every call and holds no state of its own.
+    """
+    urls = set()
+    for message in history or []:
+        if isinstance(message, dict):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+        else:
+            content = message[1] if len(message) > 1 else None
+
+        if isinstance(content, (list, tuple)):
+            content = " ".join(
+                b if isinstance(b, str) else str(b.get("text", ""))
+                for b in content
+            )
+        if isinstance(content, str):
+            urls.update(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", content))
+    return urls
+
+
+def _photos(result, history=None):
+    """
+    Show a photo for EVERY faculty member the answer cites, ONCE per
+    conversation.
+
+    NO photos on a refusal, in either form:
+      * band LOW — the LLM was never called, but `chunks` is still populated,
+        so a face would appear above "I don't have that information."
+      * `declined` — the LLM WAS called and rule 3 fired: retrieval succeeded
+        (the band stays high) but the content did not answer the question.
+
+    WHY ONCE PER CONVERSATION
+    -------------------------
+    "who is the HOD of ECE" then "what is his email" both legitimately cite
+    Ramesh's profile chunk, so his face rendered twice in a row. A chat is a
+    scrollable transcript, not a stream — the first photo is still on screen,
+    so repeating it is noise.
+
+    WHY A STRIP AND NOT INLINE
+    --------------------------
+    An earlier version showed the TOP chunk's photo only. On "who works on
+    image processing" that put one person's face above a list of five.
+
+    The obvious fix is inserting each image beside its name in the prose, but
+    that means regex-editing text an LLM generated: a model that writes [1]
+    twice, cites mid-sentence, or groups [2][3] produces mangled output. This
+    only needs to know WHICH citations appeared — a lookup, not parsing — so
+    it degrades to "no photos" rather than to garbage.
     """
     if (result.get("declined")
             or result.get("band") == "low"
             or not result.get("llm_called")):
         return ""
 
+    answer = result.get("answer") or ""
     chunks = result.get("chunks") or []
     if not chunks:
         return ""
 
-    photo = (chunks[0].get("photo_url") or "").strip()
-    if not photo:
+    seen = _already_shown(history)
+
+    # Citation [n] maps to chunks[n-1] — the same numbering _build_context
+    # used when the prompt was assembled.
+    entries = []
+    for i, chunk in enumerate(chunks, start=1):
+        if f"[{i}]" not in answer:
+            continue
+        photo = (chunk.get("photo_url") or "").strip()
+        url = chunk.get("source_url") or ""
+        if not photo or photo in seen:
+            continue
+        seen.add(photo)
+        entries.append((photo, _name_from_url(url)))
+
+    if not entries:
         return ""
 
-    return f"![]({photo})\n\n"
+    # Markdown, not <img> — Gradio 6 sanitises img tags out of message
+    # content, which is why the original single-photo version rendered nothing.
+    lines = []
+    for photo, name in entries:
+        lines.append(f"![{name}]({photo})")
+        if name:
+            lines.append(f"**{name}**")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
 
 def _badge(result):
-    """One line summarising how the answer was produced."""
+    """
+    One line summarising how the answer was produced.
+
+    Always shown, including on refusals — "LOW 0.08 · LLM skipped — no cost
+    incurred" is precisely the behaviour this project exists to demonstrate,
+    so hiding it on the refusal path would hide the thesis.
+    """
     band = result.get("band", "low")
     colour, label = BAND_STYLE.get(band, BAND_STYLE["low"])
     confidence = result.get("confidence") or 0.0
@@ -86,6 +190,10 @@ def _badge(result):
 
     if not result.get("llm_called"):
         cost = "LLM skipped — no cost incurred"
+    elif result.get("declined"):
+        model = (result.get("model") or "").split("/")[-1]
+        cost = (f"{model} found no answer in the sources" if model
+                else "no answer in the sources")
     else:
         model = (result.get("model") or "").split("/")[-1]
         cost = f"generated by {model}" if model else "LLM called"
@@ -117,14 +225,18 @@ def respond(message, history):
     from generator import answer_query
 
     try:
-        result = asyncio.run(answer_query(message))
+        # Gradio already holds the conversation, so follow-ups cost nothing to
+        # support beyond passing it down. rewrite_query() only calls an LLM
+        # when the query actually depends on it.
+        result = asyncio.run(answer_query(message, history=history))
     except Exception as exc:
         history.append({"role": "user", "content": message})
         history.append({"role": "assistant",
                         "content": f"Something went wrong: `{exc}`"})
         return history, ""
 
-    reply = _photo(result) + result["answer"] + _sources(result) + _badge(result)
+    reply = (_photos(result, history) + result["answer"]
+             + _sources(result) + _badge(result))
     history.append({"role": "user", "content": message})
     history.append({"role": "assistant", "content": reply})
     return history, ""
@@ -392,10 +504,4 @@ app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 7860))
-    )
+    uvicorn.run(app, host="0.0.0.0", port=7860)
