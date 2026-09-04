@@ -101,7 +101,22 @@ WEB_PROFILE = {
 UPLOAD_PROFILE = {
     "name": "upload",
     "abs_midpoint": 0.06,
-    "abs_temp": 0.03,
+    # Was 0.03, which behaved as a switch rather than a measurement: EVERY
+    # score above the midpoint snapped to near-1.0, so the store could never
+    # report `medium`.
+    #
+    # Observed failure — "principal of school of engineering":
+    #     upload top1 = 0.1645  ->  set_confidence 0.9702  (HIGH)
+    #     web                       set_confidence 1.0     (HIGH)
+    # Both HIGH, so the tie-break fired and uploads won by being within 10%.
+    # But the upload chunks were calendar MONTHS whose headers read "Amrita
+    # School of Engineering Bengaluru" — the reranker matched the school name,
+    # not the question. A raw 0.1645 is a marginal match and should band as
+    # such.
+    #
+    # 0.10 keeps the 14 calibration positives above the line (weakest was
+    # 0.1646) while letting scores in that region report ~0.5 rather than 0.97.
+    "abs_temp": 0.10,
     "sep_midpoint": None,
     "sep_temp": None,
     "use_sep": False,

@@ -44,30 +44,34 @@ THREE GUARDS, each from an observed failure:
 import asyncio
 import time
 from collections import Counter
-from query_expand import expand_query
 
-from confidence_V2 import UPLOAD_PROFILE, WEB_PROFILE, compute_confidence_v2
+from confidence_v2 import UPLOAD_PROFILE, WEB_PROFILE, compute_confidence_v2
 from designation import (
     SCHOOL_NAMES,
     department_in_query,
     departments_match,
     school_for_department,
+    school_in_query,
     wants_department_head,
+    wants_principal,
 )
 from embedder import embed_query
 from ensemble import get_ensemble_votes
+from query_expand import expand_query
 from reranker import rerank
+from spell_fix import correct_query
 from store import get_collection
 from upload_store import count as upload_count
 from upload_store import get_collection as get_upload_collection
-from spell_fix import correct_query
 
 RETRIEVE_N = 15
 TOP_K = 5
 
-# The upload store is small (one calendar is 9 chunks), so retrieve everything
-# rather than a top-N slice. There is no meaningful vector-search cost at this
-# size, and a truncated pool would hide chunks the reranker should judge.
+# Matches RETRIEVE_N. This was 30 while the upload store held only a 9-chunk
+# calendar and "retrieve everything" was free. Adding a 37-chunk timetable made
+# upload retrieval the entire bottleneck — 54s against the web store's 6s, for
+# twice the chunks, because upload chunks are longer and cross-encoder cost
+# scales with sequence length, not just count.
 UPLOAD_N = 15
 
 # A metadata-filtered pool is small by construction (6 head chunks, 4 principal
@@ -112,6 +116,10 @@ def retrieve(query: str, n: int = RETRIEVE_N, where: dict | None = None):
             "heading": meta.get("heading", ""),
             "designation": meta.get("designation", ""),
             "department": meta.get("department", ""),
+            # Put there by backfill_photos.py. A faculty member's photo lives
+            # only on their department's listing-page card, never on their own
+            # profile page, so it had to be carried across.
+            "photo_url": meta.get("photo_url", ""),
         }
         for doc, meta in zip(results["documents"][0], results["metadatas"][0])
     ]
@@ -121,12 +129,31 @@ def retrieve_for(query: str):
     """
     Returns (candidates, rerank_query, route, filtered).
 
-    rerank_query may differ from the user's query: the Principal fallback
-    appends the school name so the cross-encoder can separate the Engineering
-    Principal from the Computing one. Getting that wrong is a wrong answer,
-    not a near miss — there are two different people.
+    rerank_query may differ from the user's query: principal routes append the
+    school name so the cross-encoder can separate the Engineering Principal
+    from the Computing one. Getting that wrong is a wrong answer, not a near
+    miss — there are two different people.
     """
     plain = (retrieve(query), query, None, False)
+
+    # --- a direct principal query ---
+    #
+    # Checked BEFORE the department logic, because "principal" is not in
+    # HEAD_ROLES (it sits at rank 95, below head_of_department at 100), so
+    # wants_department_head() returns False and "principal of school of
+    # engineering" would fall through to plain search across all ~9,900 chunks.
+    #
+    # The principal fallback in stage 2 below reaches the same chunks, but only
+    # for a query about a DEPARTMENT that has no head of its own. A query about
+    # the SCHOOL never got there.
+    if wants_principal(query):
+        school = school_in_query(query)
+        principals = retrieve(query, n=FILTERED_N,
+                              where={"designation": "principal"})
+        if principals:
+            return (principals, f"{query} {SCHOOL_NAMES[school]}",
+                    f"principal_{school}", True)
+        return plain
 
     if not wants_department_head(query):
         return plain
@@ -246,6 +273,10 @@ async def score_query(query: str, top_k: int = TOP_K) -> dict:
     store wins: a hand-curated document an admin deliberately added is more
     authoritative than a scraped page.
     """
+    # Typos first, then abbreviations — so "endsm" -> "endsem" -> "end
+    # semester exam" chains. Reversed, the expander would not recognise the
+    # misspelled form. Both affect retrieval ONLY; the generator still receives
+    # the user's original wording.
     query, _ = correct_query(query)
     query = expand_query(query)
     t0 = time.time()
@@ -321,10 +352,19 @@ async def score_query(query: str, top_k: int = TOP_K) -> dict:
     elif strength(web) > strength(uploads):
         winner, chunks, source = web, web_chunks, "web"
     else:
-        # Same band. Upload wins ties — an admin put that document there
+        # Same band. Uploads win ties — an admin put that document there
         # deliberately, which is a stronger signal of authority than a page
         # that happened to be scraped.
-        if uploads and web and uploads["final"] >= web["final"] * 0.9:
+        #
+        # But only a NARROW tie. The margin was 10%, and on "principal of
+        # school of engineering" that handed the answer to calendar pages
+        # scoring 0.1645 over a web result at 1.0 — the calendar's chunk
+        # headers read "Amrita School of Engineering Bengaluru", so the
+        # reranker matched the school name rather than the question.
+        #
+        # 2% still lets a genuinely competitive uploaded document take
+        # precedence, without letting a weak one displace a strong web answer.
+        if uploads and web and uploads["final"] >= web["final"] * 0.98:
             winner, chunks, source = uploads, upload_chunks, "upload"
         else:
             winner, chunks, source = web, web_chunks, "web"
@@ -353,6 +393,9 @@ async def score_query(query: str, top_k: int = TOP_K) -> dict:
                 "source_url": c["source_url"],
                 "heading": c["heading"],
                 "designation": c.get("designation", ""),
+                # Read out of Chroma by retrieve(), rendered by gradio_app.
+                # Dropping it here is what made the photo never appear.
+                "photo_url": c.get("photo_url", ""),
                 "rerank_score": round(c["rerank_score"], 4),
                 "content": c["content"],
             }

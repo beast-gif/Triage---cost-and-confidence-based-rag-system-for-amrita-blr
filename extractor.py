@@ -19,7 +19,7 @@ import hashlib
 import re
 from urllib.parse import urljoin
 from designation import designation_metadata
-from designation import designation_metadata
+
 
 def hash_text(text: str, length: int = 16) -> str:
     """Short stable fingerprint of a piece of text."""
@@ -74,10 +74,25 @@ def is_new_entry_marker(li_tag: Tag) -> bool:
     return False
 
 
-def extract_chunks(html: str, source_url: str, page_title: str) -> tuple[list[dict], list[str]]:
+def extract_chunks(
+    html: str,
+    source_url: str,
+    page_title: str,
+) -> tuple[list[dict], list[str], dict[str, str]]:
     """
-    Main entry point. Takes raw HTML for ONE page and returns a list of
-    chunk dicts, each with a content-hash based chunk_id.
+    Main entry point. Takes raw HTML for ONE page and returns:
+
+        (chunks, discovered_profile_urls, discovered_photos)
+
+    Faculty photos come from whichever page the chunk is on: a listing card
+    reads its own <img>, a profile page reads its header image. An earlier
+    version carried the card photo across from pass 1 to pass 2, on the
+    assumption that profile pages had no photo of their own — they do, and
+    checking 12 of them found the header image present every time. The
+    carry-forward is gone.
+
+    discovered_photos is still returned because sync.py logs how many were
+    found, and because it costs nothing to keep the map available.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -110,6 +125,25 @@ def extract_chunks(html: str, source_url: str, page_title: str) -> tuple[list[di
     # Scope to main content area. Adjust this selector to match your
     # site's actual structure (inspect the HTML to find the right one).
     content_root = soup.select_one("main, article, .content, #content") or soup
+
+    # A faculty PROFILE page carries the person's photo in its own header —
+    # <div class="fac-inner-col fac-inner-left"><img class="wp-post-image">.
+    # Read it here so a profile page is self-sufficient, rather than depending
+    # on sync.py handing across the photo harvested from the listing card.
+    #
+    # Searched on `soup` rather than `content_root` because the header sits
+    # outside whatever main/article wrapper the page uses.
+    #
+    # Verified identical to the card photo for Dr. T. K. Ramesh, so this is
+    # about robustness, not a different image.
+    profile_photo = ""
+    profile_img = soup.select_one(
+        ".fac-inner-left img[src], img.wp-post-image[src]"
+    )
+    if profile_img:
+        resolved_profile = urljoin(source_url, profile_img["src"])
+        if resolved_profile.startswith(("http://", "https://")):
+            profile_photo = resolved_profile
 
     raw_chunks = []
     current_heading = None
@@ -167,12 +201,27 @@ def extract_chunks(html: str, source_url: str, page_title: str) -> tuple[list[di
     # as tables: extract full text, remove from tree, skip in main walk.
     FACULTY_CARD_SELECTORS = [".fc-item"]  # found by inspecting the site's faculty grid
     discovered_profile_urls: list[str] = []
+    # profile_url -> photo_url, handed to pass 2 by sync.py. get_text() throws
+    # <img> away, so without capturing it here the URL is lost before chunking.
+    discovered_photos: dict[str, str] = {}
+
     for card_selector in FACULTY_CARD_SELECTORS:
         for card_tag in content_root.select(card_selector):
             card_text = card_tag.get_text(" ", strip=True)
             card_text = re.sub(r"\s+", " ", card_text).strip()
             if not card_text:
                 continue
+
+            # Photo sits in a plain src on this site — no lazy-loading
+            # placeholder to work around. The alt attribute carries the
+            # person's name, which is a useful cross-check that the image
+            # belongs to the card it was found in.
+            img_tag = card_tag.find("img", src=True)
+            card_photo = ""
+            if img_tag:
+                resolved_img = urljoin(source_url, img_tag["src"])
+                if resolved_img.startswith(("http://", "https://")):
+                    card_photo = resolved_img
 
             # Capture the profile page link if this card wraps one, so the
             # chatbot can point users to the individual faculty profile
@@ -190,12 +239,15 @@ def extract_chunks(html: str, source_url: str, page_title: str) -> tuple[list[di
             if profile_url:
                 card_text = f"{card_text} Profile: {profile_url}"
                 discovered_profile_urls.append(profile_url)
+                if card_photo:
+                    discovered_photos[profile_url] = card_photo
 
             full_text = f"Faculty\n\n{card_text}"
             raw_chunks.append({
                 "heading": "Faculty",
                 "content": full_text,
                 "chunk_type": "faculty_card",
+                "photo_url": card_photo,
             })
             card_tag.decompose()  # remove so the main walk below doesn't re-process it
 
@@ -233,7 +285,10 @@ def extract_chunks(html: str, source_url: str, page_title: str) -> tuple[list[di
             "chunk_type": chunk_type,
             "content": content,
             "token_estimate": estimate_tokens(content),
+            # A card chunk uses its own card image; every other chunk on a
+            # profile page uses that page's header image.
+            "photo_url": c.get("photo_url") or profile_photo or "",
             **designation_metadata(content, source_url, chunk_type),
         })
 
-    return final_chunks, discovered_profile_urls
+    return final_chunks, discovered_profile_urls, discovered_photos

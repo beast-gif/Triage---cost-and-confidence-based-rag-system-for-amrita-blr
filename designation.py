@@ -464,6 +464,75 @@ SCHOOL_NAMES = {
     "computing": "School of Computing",
 }
 
+# Which SCHOOL a query is asking about, for principal queries. Distinct from
+# DEPARTMENT_SCHOOL above: that maps a department to its school, this matches
+# school names appearing directly in a query.
+#
+# Longest first. 'robotics and ai' MUST be tested before 'ai', because it
+# belongs to Engineering despite containing "AI" — a naive substring match
+# sends it to the Computing principal, which is the wrong person.
+SCHOOL_PATTERNS = [
+    # --- Computing: the AI-related schools share one principal ---
+    (r"school\s+of\s+artificial\s+intelligence", "computing"),
+    (r"school\s+of\s+computing", "computing"),
+    (r"\bartificial\s+intelligence\s+and\s+data\s+science\b", "computing"),
+    (r"\bcomputer\s+science\b", "computing"),
+    (r"\bcomputing\b", "computing"),
+    (r"\bcse\b", "computing"),
+    (r"\baids\b", "computing"),
+
+    # --- Engineering ---
+    (r"school\s+of\s+engineering", "engineering"),
+    (r"\bengineering\s+school\b", "engineering"),
+]
+
+_SCHOOL_PATTERNS = [(re.compile(p, re.I), school) for p, school in SCHOOL_PATTERNS]
+
+# 'robotics and ai' is an ENGINEERING program whose name contains "AI". Checked
+# before the school patterns so it cannot be dragged into Computing.
+_ENGINEERING_TRAPS = re.compile(
+    r"\brobotics(\s+and\s+ai)?\b|\bmechanical\b|\belectrical\b|"
+    r"\belectronics\b|\bcivil\b|\benglish\b|\bchemistry\b|\bphysics\b",
+    re.I,
+)
+
+_PRINCIPAL_RE = re.compile(r"\bprincipal\b", re.I)
+
+# Bare "who is the principal" with no school named. There are two, so this has
+# to resolve somehow — Engineering is the larger school and the default.
+DEFAULT_PRINCIPAL_SCHOOL = "engineering"
+
+
+def wants_principal(query):
+    """Is this query asking who a PRINCIPAL is?"""
+    return bool(_PRINCIPAL_RE.search(query or ""))
+
+
+def school_in_query(query):
+    """
+    Which school's principal is being asked about.
+
+    Returns 'engineering' or 'computing' — never None, because a bare
+    "who is the principal" still has to resolve to somebody, and Engineering is
+    the default.
+
+    Engineering traps are checked FIRST: "principal of robotics and ai" names an
+    Engineering program, and matching "ai" would otherwise route it to the
+    Computing principal. Two different people, so that is a wrong answer rather
+    than a near miss.
+    """
+    if not query:
+        return DEFAULT_PRINCIPAL_SCHOOL
+
+    if _ENGINEERING_TRAPS.search(query):
+        return "engineering"
+
+    for pattern, school in _SCHOOL_PATTERNS:
+        if pattern.search(query):
+            return school
+
+    return DEFAULT_PRINCIPAL_SCHOOL
+
 # Longest phrases first, so 'computer science and engineering' wins over
 # 'computer science', and 'artificial intelligence and data science' over 'ai'.
 _DEPT_QUERY_PATTERNS = sorted(

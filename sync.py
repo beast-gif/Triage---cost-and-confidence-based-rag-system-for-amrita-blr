@@ -78,7 +78,8 @@ def save_html_to_disk(url: str, html: str, out_dir: str = RAW_HTML_DIR):
         f.write(html)
 
 
-def process_page(result, manifest, seen_urls, collect_profiles=None):
+def process_page(result, manifest, seen_urls, collect_profiles=None,
+                 collect_photos=None):
     """
     Scrape result -> extract -> diff against manifest -> embed only what changed.
 
@@ -99,13 +100,15 @@ def process_page(result, manifest, seen_urls, collect_profiles=None):
     if SAVE_RAW_HTML:
         save_html_to_disk(url, result["html"])
 
-    chunks, page_profile_urls = extract_chunks(
+    chunks, page_profile_urls, page_photos = extract_chunks(
         html=result["html"],
         source_url=url,
         page_title=result["title"],
     )
     if collect_profiles is not None:
         collect_profiles.update(page_profile_urls)
+    if collect_photos is not None:
+        collect_photos.update(page_photos)
 
     chunks_by_id = {c["chunk_id"]: c for c in chunks}
     new_ids = set(chunks_by_id.keys())
@@ -144,6 +147,7 @@ async def sync():
     manifest = Manifest()
     seen_urls: set[str] = set()
     discovered_profile_urls: set[str] = set()
+    discovered_photos: dict[str, str] = {}
 
     total_added = total_deleted = total_unchanged = 0
 
@@ -151,14 +155,16 @@ async def sync():
     print(f"Pass 1 — scraping {len(urls)} seed URLs...")
     for result in await scrape_all(urls):
         a, d, u = process_page(result, manifest, seen_urls,
-                               collect_profiles=discovered_profile_urls)
+                               collect_profiles=discovered_profile_urls,
+                               collect_photos=discovered_photos)
         total_added += a
         total_deleted += d
         total_unchanged += u
 
     # --- PASS 2: faculty profiles discovered in pass 1 ---
     # These are never in seed_urls.json; the only reason we know they exist is
-    # the <a href> inside each .fc-item faculty card.
+    # the <a href> inside each .fc-item faculty card. Each profile page carries
+    # its own header photo, so nothing needs handing across from pass 1.
     if discovered_profile_urls:
         profile_list = sorted(discovered_profile_urls)
         print(f"\nPass 2 — {len(profile_list)} faculty profile URLs discovered...")
