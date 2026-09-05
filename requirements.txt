@@ -1,14 +1,44 @@
-fastapi
-uvicorn[standard]
-gradio>=6
-pydantic>=2
-
-sentence-transformers
-chromadb
+# --- scraping ---------------------------------------------------------
 crawl4ai
 beautifulsoup4
 
+# --- retrieval --------------------------------------------------------
+# sentence-transformers supplies BOTH models: bge-base-en-v1.5 for embeddings
+# and bge-reranker-base as a CrossEncoder.
+#
+# NOTE: CrossEncoder.predict() already applies a sigmoid for this reranker.
+# Applying another one compresses every score into [0.50, 0.73] and makes the
+# confidence bands unreachable — see confidence_V2.py.
+sentence-transformers
+chromadb
+numpy
+
+# --- query preprocessing ----------------------------------------------
+# rapidfuzz backs spell_fix.py, matched against the corpus's OWN vocabulary
+# rather than a dictionary — a general spell checker mangles "Vidyapeetham",
+# "Chittawadigi" and "Shikshak".
+rapidfuzz
+
+# --- document upload --------------------------------------------------
+# pdfplumber, NOT pypdf: pypdf reads by text-object order, which detached
+# academic-calendar events from their dates. pdfplumber preserves cell
+# structure.
+pdfplumber
+python-pptx
+python-docx
+openpyxl
+
+# --- LLM calls --------------------------------------------------------
+# The OpenAI SDK pointed at OpenRouter's base_url — one key, many providers.
+# Used by the 5-model ensemble, the answer generator, and the query rewriter.
 openai
 python-dotenv
+
+# --- serving ----------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic>=2
+# Gradio 6+. Pinning below 5 breaks: 4.44 needs HfFolder, which newer
+# huggingface_hub versions (pulled in by sentence-transformers) removed.
+gradio>=6
 apscheduler
-numpy
