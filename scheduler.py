@@ -138,6 +138,17 @@ def run_sync(triggered_by="schedule"):
         STATUS["health"] = check_head_coverage()
         STATUS["last_status"] = "ok"
 
+        # Conversations untouched for 30 days go here, not on a request path —
+        # housekeeping should not be charged to whoever asks the next question.
+        try:
+            import conversations
+            expired = conversations.cleanup_expired()
+            STATUS["conversations_expired"] = expired
+            if expired:
+                print(f"[sync] expired {expired} inactive conversation(s)")
+        except Exception as exc:
+            print(f"[sync] conversation cleanup skipped: {exc}")
+
         for warning in STATUS["health"]["warnings"]:
             print(f"[sync] WARNING: {warning}")
 

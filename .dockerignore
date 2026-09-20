@@ -1,0 +1,55 @@
+# ===========================================================
+# Keeps the build context small and secrets out of the image.
+#
+# A Docker image layer is permanent: anything COPYed in can be
+# read back out of the published image even if a later layer
+# deletes it. .env must never enter the context.
+# ===========================================================
+
+.env
+.env.*
+
+# --- python ------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- vcs / editors -----------------------------------------
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# --- frontend ----------------------------------------------
+# The React app deploys to Vercel, not into this image. Its
+# node_modules is hundreds of megabytes of build context that
+# would be uploaded and then ignored.
+node_modules/
+dist/
+src/
+public/
+package.json
+package-lock.json
+vite.config.js
+index.html
+
+# --- local state -------------------------------------------
+conversations.db*
+.crawl4ai/
+*.log
+
+# --- dev-only scripts --------------------------------------
+# Diagnostics and one-off backfills. Harmless, but they are not
+# part of serving and keep the image smaller out of it.
+diagnose_chairperson.py
+probe_uploads.py
+calibrate.py
+repl.py
+bench_rerank.py
+
+# ===========================================================
+# chroma_db/ is NOT listed here on purpose — it has to be in
+# the image for the bot to answer anything on first boot.
+# ===========================================================

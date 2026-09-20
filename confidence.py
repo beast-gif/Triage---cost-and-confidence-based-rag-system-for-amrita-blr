@@ -248,9 +248,20 @@ def _retrieve_uploads(query: str, top_k: int):
 BAND_RANK = {"low": 0, "medium": 1, "high": 2}
 
 
-async def score_query(query: str, top_k: int = TOP_K, history=None) -> dict:
+def _noop_stage(_name: str) -> None:
+    """Default on_stage. Keeps every call site free of `if on_stage:`."""
+
+
+async def score_query(query: str, top_k: int = TOP_K, history=None,
+                      on_stage=None) -> dict:
     """
     Use THIS from FastAPI; __main__ wraps it in asyncio.run().
+
+    on_stage(name) is called as each phase BEGINS, for the /chat/stream
+    progress bar. It is a plain sync callback and is only ever invoked from
+    this coroutine — never from inside the asyncio.to_thread workers — so it
+    can safely touch an asyncio.Queue via put_nowait(). Optional: everything
+    works identically without it.
 
     THREE THINGS RUN CONCURRENTLY
     -----------------------------
@@ -274,6 +285,10 @@ async def score_query(query: str, top_k: int = TOP_K, history=None) -> dict:
     store wins: a hand-curated document an admin deliberately added is more
     authoritative than a scraped page.
     """
+    on_stage = on_stage or _noop_stage
+
+    on_stage("understanding")
+
     # Conversation memory. MUST run first: retrieve_for() picks its route from
     # the query text, so "what about EEE" routes nowhere until it becomes
     # "who is the chairperson of EEE". Skipped entirely — no LLM call — when
@@ -306,11 +321,19 @@ async def score_query(query: str, top_k: int = TOP_K, history=None) -> dict:
         print(f"[timing] ensemble        = {time.time() - started:.2f}s")
         return out
 
+    # The three concurrent legs are ONE stage, not three. They finish out of
+    # order and the reranker's predict() is a single blocking call with no
+    # internal callback, so there is no honest sub-progress to report between
+    # here and the gather returning. This is the ~75% stage.
+    on_stage("searching")
+
     web_result, upload_result, votes = await asyncio.gather(
         _timed_web(), _timed_uploads(), _timed_ensemble(),
         return_exceptions=True,
     )
     print(f"[timing] scoring total   = {time.time() - t0:.2f}s")
+
+    on_stage("scoring")
 
     if isinstance(web_result, BaseException):
         raise web_result
