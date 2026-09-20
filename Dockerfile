@@ -23,7 +23,26 @@ ENV HOME=/home/user \
 WORKDIR $HOME/app
 
 COPY --chown=user requirements.txt .
+
+# Install CPU-ONLY torch first, from PyTorch's own CPU index.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS
+# -----------------------------------
+# requirements.txt asks for sentence-transformers, which depends on torch. On
+# Linux, plain `pip install torch` resolves to the CUDA build: it drags in
+# nvidia-cublas, nvidia-cudnn, nvidia-cufft and friends — well over 2GB of GPU
+# runtime. None of it is reachable here. Railway has no GPU, the models run on
+# CPU, and torch reports itself as +cpu on the dev machine anyway.
+#
+# That bloat is invisible locally (Windows pip already resolves to +cpu) and
+# only appears when the image is built on Linux, which is why an image that
+# seems fine in development can be several GB larger in CI.
+#
+# Installing the CPU wheel first means the requirements install below finds
+# torch already satisfied and leaves it alone.
 RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch \
+        --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements.txt
 
 # Install the browser binary itself. Separate layer so a code change does not
