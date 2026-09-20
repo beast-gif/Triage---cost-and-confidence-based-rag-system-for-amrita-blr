@@ -1,5 +1,4 @@
 .env
-chroma_db/
 manifest.db
 raw_html/
 __pycache__/
