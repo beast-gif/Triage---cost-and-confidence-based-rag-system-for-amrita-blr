@@ -95,23 +95,17 @@ async def lifespan(app: FastAPI):
 
     # --- weekly data refresh, in-process so it works on any platform ---
     #
-    # Off by default in deployment: set ENABLE_SCHEDULER=1 to turn it on.
+    # Sunday 03:00 Asia/Kolkata — the timezone is pinned in scheduler.py, so
+    # it means 03:00 IST wherever the host's clock is set.
     #
-    # APScheduler assumes an always-on host. A free Space sleeps after idle
-    # time, so the weekly job fires only if someone happens to be using the
-    # bot at that moment — and when it does fire it scrapes several hundred
-    # faculty pages on a 2-vCPU box, which is the whole machine for minutes.
-    # Worse, on ephemeral disk the freshly synced chroma_db is discarded at the
-    # next restart, so the cost buys nothing.
-    #
-    # Locally, where the host stays up and the disk persists, it is genuinely
-    # useful — hence an env flag rather than deleting it.
-    if os.getenv("ENABLE_SCHEDULER", "").lower() in ("1", "true", "yes"):
-        from scheduler import start_scheduler
-        app.state.scheduler = start_scheduler()
-    else:
-        app.state.scheduler = None
-        print("scheduler disabled (set ENABLE_SCHEDULER=1 to enable)")
+    # NOTE FOR ANY FUTURE DEPLOYMENT: this assumes a host that stays awake and
+    # keeps its disk. On a container with ephemeral storage the job still runs,
+    # scraping several hundred faculty pages for minutes, and then loses the
+    # updated chroma_db at the next restart — spending the CPU for nothing.
+    # If this is ever deployed somewhere like that, gate this line behind an
+    # env flag rather than leaving it on.
+    from scheduler import start_scheduler
+    app.state.scheduler = start_scheduler()
 
     yield
 
@@ -296,11 +290,9 @@ async def sync_status():
     """
     from scheduler import STATUS, next_run_time
 
-    # next_run_time() is only called when a scheduler exists. Before
-    # ENABLE_SCHEDULER, app.state.scheduler was always a real object and None
-    # was unreachable; now None is the NORMAL deployed state, and reaching a
-    # function that expects a scheduler would turn this endpoint into a 500 on
-    # every call.
+    # next_run_time() is only called when a scheduler exists. It always does
+    # today, but startup can fail, and an endpoint that 500s while reporting on
+    # the health of something else is the wrong failure.
     scheduler = getattr(app.state, "scheduler", None)
 
     return {
