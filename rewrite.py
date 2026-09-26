@@ -61,7 +61,7 @@ DEPENDENT_PATTERNS = [
     # bare demonstratives
     r"\b(that one|this one|the same|those|these)\b",
     # elliptical follow-ups: "and for EEE?", "for mechanical?"
-    r"^\s*(and\s+)?for\s+\w+\s*\??$",
+    r"^\s*(and\s+)?(for|in|about|from)\s+[\w-]+(\s+[\w-]+){0,2}\s*\??$",
 ]
 
 _DEPENDENT = [re.compile(p, re.I) for p in DEPENDENT_PATTERNS]

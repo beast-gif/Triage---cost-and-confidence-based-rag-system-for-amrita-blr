@@ -570,6 +570,21 @@ async def delete_conversation(conversation_id: str):
     return {"deleted": conversation_id}
 
 
+# ---------------------------------------------------------------------------
+# WhatsApp
+# ---------------------------------------------------------------------------
+# Imported last, and at the bottom, because whatsapp.py calls back into
+# _answer_and_persist above. That import lives inside the function rather than
+# at its module scope, so there is no cycle — but keeping the include here
+# makes the direction of the dependency obvious.
+#
+# The routes are inert until the WHATSAPP_* variables are set: the webhook
+# rejects every request without WHATSAPP_APP_SECRET, deliberately.
+import whatsapp  # noqa: E402
+
+app.include_router(whatsapp.router)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)

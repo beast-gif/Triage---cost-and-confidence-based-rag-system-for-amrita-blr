@@ -224,9 +224,31 @@ async def answer_query(query, history=None, on_stage=None):
     """
     Full pipeline: rewrite -> retrieve -> score -> generate.
 
-    `history` is only used to make a follow-up question standalone for
-    RETRIEVAL. The generator still receives the user's original wording — it
-    reads better, and the rewritten form is a machine artefact.
+    `history` makes a follow-up standalone. The REWRITTEN form is then used for
+    both retrieval and generation.
+
+    WHY GENERATION TOO — THIS USED TO PASS THE ORIGINAL
+    ---------------------------------------------------
+    The original wording reads better, so it was handed to the generator while
+    only retrieval saw the rewrite. That works for a pronoun swap: "what is his
+    email" is still a question, and with the right chunks the model answers it.
+
+    It fails completely for an elliptical fragment. Measured:
+
+        user  : "faculty working on image processing in cse department"  -> fine
+        user  : "in ece department"
+                rewrite -> "faculty working on image processing in ece department"
+                retrieval: correct, three ECE image-processing faculty
+                generator prompt: "Question: in ece department"
+                answer: "I don't have that information."
+
+    Retrieval had the right chunks. The generator was asked to answer a
+    prepositional phrase, found no question in it, and rule 3 fired — which is
+    rule 3 behaving correctly on a prompt that should never have been built.
+
+    So the rewritten text is now used for both. It is only ever different when
+    the query genuinely was not standalone, in which case the original was not
+    answerable anyway.
 
     `on_stage(name)` reports phase transitions for the /chat/stream progress
     bar. Optional — omitted, the pipeline behaves exactly as before.
@@ -245,7 +267,11 @@ async def answer_query(query, history=None, on_stage=None):
     # means the "generating" event just queued never reaches the SSE client
     # until after the answer is already finished — the progress bar would jump
     # straight from "scoring" to done, skipping the stage it is reporting.
-    generated = await asyncio.to_thread(generate_answer, query, result)
+    # Falls back to the original when score_query did not supply one, so an
+    # older caller or a stubbed result still works.
+    asked = result.get("query_used") or query
+
+    generated = await asyncio.to_thread(generate_answer, asked, result)
     generated["confidence"] = result.get("final_confidence")
     generated["route"] = result.get("route")
     generated["retrieval"] = result.get("retrieval_details", {})

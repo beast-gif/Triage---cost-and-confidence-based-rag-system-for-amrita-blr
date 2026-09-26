@@ -45,8 +45,11 @@ import asyncio
 import time
 from collections import Counter
 
+import re
+
 from confidence_v2 import UPLOAD_PROFILE, WEB_PROFILE, compute_confidence_v2
 from designation import (
+    DEPARTMENT_ALIASES,
     SCHOOL_NAMES,
     department_in_query,
     departments_match,
@@ -79,6 +82,48 @@ UPLOAD_N = 15
 # chunks today), so ask for plenty. Otherwise Chroma's vector index — not the
 # filter — decides who makes the pool.
 FILTERED_N = 50
+
+# The department-scoped faculty pool is NOT small by construction — one
+# department has hundreds of chunks. So this is a normal vector search that
+# happens to be confined to a department, and it is sized like one. Asking for
+# 200 would mean reranking 200 pairs, which at ~1s per pair is several minutes.
+DEPT_N = 20
+
+# Words that make a query about PEOPLE rather than about a department's
+# programs, facilities or admissions.
+#
+# The department filter must not fire on "what programs does ECE offer".
+# department_canon is written only onto faculty chunks, so filtering a
+# programs question by it would confine the search to staff profiles and
+# guarantee a wrong answer. Naming a department is not enough on its own —
+# the query has to be asking about the people in it.
+_FACULTY_QUERY_PATTERNS = [
+    re.compile(r"\b(teacher|teachers|faculty|professor|professors|lecturer|"
+               r"lecturers|staff|researcher|researchers|scientist|scientists)\b", re.I),
+    re.compile(r"\bwho\s+(?:works?|work|teaches|teach|researches)\b", re.I),
+    re.compile(r"\bworking\s+(?:on|in)\b", re.I),
+    re.compile(r"\bresearch\s+(?:interest|interests|area|areas)\b", re.I),
+]
+
+# The School of Computing publishes ONE faculty listing for the whole school,
+# so its staff are tagged 'computing' — the page does not separate CSE from AI
+# from AI&DS. A query naming one of those maps to the school, which scopes the
+# search correctly but no more finely than the source data allows.
+_DEPT_TO_TAG = {
+    "computer science": "computing",
+    "artificial intelligence": "computing",
+}
+
+
+def wants_faculty_in_department(query: str) -> bool:
+    """Is this asking about the PEOPLE in a named department?"""
+    return any(rx.search(query or "") for rx in _FACULTY_QUERY_PATTERNS)
+
+
+def _department_tag(dept: str) -> str:
+    """Query department -> the value stored in department_canon."""
+    canonical = DEPARTMENT_ALIASES.get(dept.lower(), dept.lower())
+    return _DEPT_TO_TAG.get(canonical, canonical)
 
 
 def ensemble_agreement(votes: list[str], expected: int = 5) -> dict:
@@ -155,6 +200,53 @@ def retrieve_for(query: str):
             return (principals, f"{query} {SCHOOL_NAMES[school]}",
                     f"principal_{school}", True)
         return plain
+
+    # --- faculty within a named department ---
+    #
+    # Checked BEFORE wants_department_head so it cannot steal a head query:
+    # "who is the head of ECE" reaches the stage-1 filter below, while
+    # "teachers working on image processing in ECE" lands here.
+    #
+    # WHY THIS ROUTE EXISTS
+    # Adding a department to a working query made it WORSE. "teachers working
+    # on image processing" answered; "teachers working on image processing in
+    # ECE department" did not. The extra words shifted the query embedding
+    # toward department landing pages and diluted "image processing", which is
+    # the phrase that had to match. Narrowing by metadata instead lets the
+    # department constrain the search without competing for space in the
+    # embedding.
+    #
+    # Scored with filtered=True, like the head and principal routes. This was
+    # filtered=False first, on the reasoning that a vector-ranked top-20 drawn
+    # from hundreds of department chunks still leaves a real rejected set.
+    # Measured on "teachers working on image processing in ECE", that was
+    # wrong, and wrong in the direction that matters:
+    #
+    #                        top1     noise floor   ratio   sep    band
+    #   plain search        0.0708      0.0020      33.8x  0.8378  HIGH
+    #   department-filtered 0.5154      0.0500      10.3x  0.2813  LOW
+    #
+    # The filter improved retrieval 7x and the score FELL. sep_signal measures
+    # the top hit against the pool's noise floor, and filtering is the act of
+    # deleting the noise — so the floor rose from 0.002 to 0.05, the ratio
+    # collapsed, and a better pool read as a worse one.
+    #
+    # Same trap as the Principal query that scored 0.0116 LOW with the right
+    # answer at rank 1. filtered=True swaps sep for rank_confidence, which asks
+    # "do I know WHICH one" rather than "does this beat the junk" — and there
+    # is no junk left to beat. Same pool scores 0.9988 HIGH.
+    if not wants_department_head(query) and not wants_principal(query):
+        dept = department_in_query(query)
+        if dept and wants_faculty_in_department(query):
+            tag = _department_tag(dept)
+            scoped = retrieve(query, n=DEPT_N, where={"department_canon": tag})
+            if scoped:
+                return scoped, query, f"faculty_{tag}", True
+            # No chunks carry that tag — backfill_departments.py has not been
+            # run, or this department has no listing page. Plain search is a
+            # worse answer than a filtered one but a much better answer than
+            # an empty one.
+            return plain
 
     if not wants_department_head(query):
         return plain
@@ -293,6 +385,10 @@ async def score_query(query: str, top_k: int = TOP_K, history=None,
     # the query text, so "what about EEE" routes nowhere until it becomes
     # "who is the chairperson of EEE". Skipped entirely — no LLM call — when
     # the query is already standalone, which most are.
+    # `original` is kept for query_original in the returned dict.
+    # rewrite.py logs the rewrite itself (its line 216), so nothing is
+    # printed here — an earlier duplicate log came from adding a second one.
+    original = query
     query, _rewritten = rewrite_query(query, history)
 
     # Typos, then abbreviations — so "endsm" -> "endsem" -> "end semester
@@ -363,6 +459,7 @@ async def score_query(query: str, top_k: int = TOP_K, history=None,
     if not web and not uploads:
         return {
             "final_confidence": 0.0, "band": "low", "route": route,
+            "query_used": query, "query_original": original,
             "source": None, "routing_label": ensemble["majority_label"],
             "generator_mode": "disambiguate", "retrieval_details": {},
             "ensemble_details": ensemble, "chunks": [],
@@ -401,10 +498,17 @@ async def score_query(query: str, top_k: int = TOP_K, history=None,
 
     loser = web if source == "upload" else uploads
 
+
     return {
         "final_confidence": winner["final"],
         "band": winner["band"],
         "generator_mode": winner["generator_mode"],
+        # The text retrieval actually ran on, after rewrite/spell-fix/expand.
+        # generator.answer_query() needs it: an elliptical follow-up like
+        # "in ece department" retrieves correctly but cannot be ANSWERED,
+        # because it is not a question. See the note there.
+        "query_used": query,
+        "query_original": original,
         "source": source,
         "route": route if source == "web" else "uploaded_documents",
         "routing_label": ensemble["majority_label"],

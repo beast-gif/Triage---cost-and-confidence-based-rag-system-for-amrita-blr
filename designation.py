@@ -444,9 +444,12 @@ DEPARTMENT_SCHOOL = {
     "electrical and electronics": "engineering",
     "eee": "engineering",
     "electrical and computer": "engineering",
+    "eac": "engineering",
     "mechanical": "engineering",
     "english": "engineering",
     "robotics": "engineering",
+    "chemistry": "engineering",
+    "physics": "engineering",
     # School of Computing
     "computer science and engineering": "computing",
     "computer science": "computing",
@@ -457,11 +460,15 @@ DEPARTMENT_SCHOOL = {
     "computing": "computing",
     "aids": "computing",
     "ai": "computing",
+    "aie": "computing",
+    # School of Business
+    "business": "business",
 }
 
 SCHOOL_NAMES = {
     "engineering": "School of Engineering",
     "computing": "School of Computing",
+    "business": "School of Business", 
 }
 
 # Which SCHOOL a query is asking about, for principal queries. Distinct from

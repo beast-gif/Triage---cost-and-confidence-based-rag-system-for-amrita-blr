@@ -189,6 +189,52 @@ async def sync():
 
     manifest.close()
 
+    # --- metadata the extractor cannot write ---
+    #
+    # photo_url and department_canon do not come from the chunk's own page.
+    # They come from the FACULTY LISTING page, which knows two things a
+    # profile page never states: which department a person belongs to, and
+    # (historically) what they look like.
+    #
+    # That makes them invisible to the delta-sync. chunk_id hashes content, so
+    # a chunk whose text changed is re-upserted with fresh metadata straight
+    # from the extractor — and the extractor has never heard of either field.
+    # The tag is silently dropped, department filtering quietly stops matching
+    # that person, and nothing errors.
+    #
+    # So the backfills run here rather than being a step someone has to
+    # remember. They are idempotent: a chunk already carrying the right value
+    # is skipped, so a redundant run writes nothing.
+    #
+    # Skipped entirely when nothing changed — untouched chunks kept their
+    # metadata, and re-scraping five listing pages for no reason is 40s of
+    # nobody's time.
+    if total_added:
+        print("\n" + "=" * 50)
+        print("POST-SYNC METADATA")
+        print("=" * 50)
+        print(f"{total_added} chunks were re-upserted and lost their "
+              f"backfilled metadata. Restoring it...\n")
+
+        # Imported here, not at module scope: these import store and the
+        # scraper too, and a top-level import would make a circular-looking
+        # dependency out of what is really a one-way call.
+        from backfill_departments import run as backfill_departments
+        from backfill_photos import run as backfill_photos
+
+        for name, backfill in (("photos", backfill_photos),
+                               ("departments", backfill_departments)):
+            try:
+                await backfill(apply=True)
+            except Exception as exc:
+                # A failed backfill must not fail the sync. The chunks and
+                # their embeddings are already committed and correct; what is
+                # missing is metadata that can be restored by running the
+                # script by hand.
+                print(f"\n[WARN] {name} backfill failed: {exc}")
+                print(f"       run  python backfill_{name}.py --apply  "
+                      f"to restore it")
+
     print("\n" + "=" * 50)
     print("SYNC SUMMARY")
     print("=" * 50)
